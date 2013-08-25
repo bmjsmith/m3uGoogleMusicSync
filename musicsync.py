@@ -66,8 +66,9 @@ class MusicSync(object):
         print "Fetching playlists from Google..."
         self.playlists = self.wc.get_all_playlist_ids(auto=False)
         print "Got %d playlists." % len(self.playlists['user'])
-        print ""
-
+        print "Fetching songs from Google..."
+        self.songs = self.wc.get_all_songs()
+        print "Got %d songs." % len(self.songs)        
 
     def auth(self):
         self.logged_in = self.wc.login(self.email, self.password)
@@ -75,10 +76,8 @@ class MusicSync(object):
             print "Login failed..."
             exit()
 
-        print ""
         print "Logged in as %s" % self.email
-        print ""
-
+        
         if not os.path.isfile(OAUTH_FILEPATH):
             print "First time login. Please follow the instructions below:"
             self.mm.perform_oauth()
@@ -88,108 +87,98 @@ class MusicSync(object):
             exit()
 
         print "Authenticated"
-        print ""
-
-
+        
     def sync_playlist(self, filename, remove_missing=False):
         filename = self.get_platform_path(filename)
         os.chdir(os.path.dirname(filename))
         title = os.path.splitext(os.path.basename(filename))[0]
-        print "Synching playlist: %s" % filename
-        if title not in self.playlists['user']:
-            print "   didn't exist... creating..."
-            self.playlists['user'][title] = [self.wc.create_playlist(title)]
-        print ""
-
-        plid = self.playlists['user'][title][0]
-        goog_songs = self.wc.get_playlist_songs(plid)
-        print "%d songs already in Google Music playlist" % len(goog_songs)
-        pc_songs = self.get_files_from_playlist(filename)
-        print "%d songs in local playlist" % len(pc_songs)
-
-        # Sanity check max 1000 songs per playlist
-        if len(pc_songs) > MAX_SONGS_IN_PLAYLIST:
-            print "    Google music doesn't allow more than %d songs in a playlist..." % MAX_SONGS_IN_PLAYLIST
-            print "    Will only attempt to sync the first %d songs." % MAX_SONGS_IN_PLAYLIST
-            del pc_songs[MAX_SONGS_IN_PLAYLIST:]
-
-        existing_files = 0
-        added_files = 0
-        failed_files = 0
-        removed_files = 0
-        fatal_count = 0
-
-        for fn in pc_songs:
-            if self.file_already_in_list(fn, goog_songs):
-                existing_files += 1
-                continue
-            print ""
-            print "Adding: %s" % os.path.basename(fn)
-            online = self.find_song(fn)
-            song_id = None
-            if online:
-                song_id = online['id']
-                print "   already uploaded [%s]" % song_id
-            else:
-                attempts = 0
-                result = []
-                while not result and attempts < MAX_UPLOAD_ATTEMPTS_PER_FILE:
-                    print "   uploading... (may take a while)"
-                    attempts += 1
+        print "Syncing playlist: %s" % filename
+        if title in self.playlists['user']:
+            plid = self.playlists['user'][title][0]        
+            goog_songs = self.wc.get_playlist_songs(plid)
+            print "  %d songs already in Google Music playlist" % len(goog_songs)
+            pc_songs = self.get_files_from_playlist(filename)
+            print "  %d songs in local playlist" % len(pc_songs)
+            
+            # Sanity check max 1000 songs per playlist
+            if len(pc_songs) > MAX_SONGS_IN_PLAYLIST:
+                print "    Google music doesn't allow more than %d songs in a playlist..." % MAX_SONGS_IN_PLAYLIST
+                print "    Will only attempt to sync the first %d songs." % MAX_SONGS_IN_PLAYLIST
+                del pc_songs[MAX_SONGS_IN_PLAYLIST:]
+    
+            existing_files = 0
+            added_files = 0
+            failed_files = 0
+            removed_files = 0
+            fatal_count = 0
+            # print "Google songs: %s" % goog_songs
+            for fn in pc_songs:
+                if self.file_already_in_list(fn, goog_songs):
+                    existing_files += 1
+                    continue
+                print "  adding: %s" % os.path.basename(fn)
+                online = self.find_song(fn)
+                song_id = None
+                if online:
+                    song_id = online['id']
+                    print "  already uploaded [%s]" % song_id
+                else:
+                    attempts = 0
+                    result = []
+                    while not result and attempts < MAX_UPLOAD_ATTEMPTS_PER_FILE:
+                        print "  uploading... (may take a while)"
+                        attempts += 1
+                        try:
+                            result = self.mm.upload(fn)
+                        except (BadStatusLine, CannotSendRequest):
+                            # Bail out if we're getting too many disconnects
+                            if fatal_count >= MAX_CONNECTION_ERRORS_BEFORE_QUIT:
+                               print "Too many disconnections - quitting. Please try running the script again."
+                               exit()
+    
+                            print "Connection Error -- Reattempting login"
+                            fatal_count += 1
+                            self.wc.logout()
+                            self.mm.logout()
+                            result = []
+                            time.sleep(STANDARD_SLEEP)
+    
+                        except:
+                            result = []
+                            time.sleep(STANDARD_SLEEP)
+    
                     try:
-                        result = self.mm.upload(fn)
-                    except (BadStatusLine, CannotSendRequest):
-                        # Bail out if we're getting too many disconnects
-                        if fatal_count >= MAX_CONNECTION_ERRORS_BEFORE_QUIT:
-                            print ""
-                            print "Too many disconnections - quitting. Please try running the script again."
-                            print ""
-                            exit()
-
-                        print "Connection Error -- Reattempting login"
-                        fatal_count += 1
-                        self.wc.logout()
-                        self.mm.logout()
-                        result = []
-                        time.sleep(STANDARD_SLEEP)
-
+                        if result[0]:
+                            song_id = result[0].itervalues().next()
+                        else:
+                            song_id = result[1].itervalues().next()
+                        print "  upload complete [%s]" % song_id
                     except:
-                        result = []
-                        time.sleep(STANDARD_SLEEP)
-
-                try:
-                    if result[0]:
-                        song_id = result[0].itervalues().next()
-                    else:
-                        song_id = result[1].itervalues().next()
-                    print "   upload complete [%s]" % song_id
-                except:
-                    print "      upload failed - skipping"
-
-            if not song_id:
-                failed_files += 1
-                continue
-
-            added = self.wc.add_songs_to_playlist(plid, song_id)
-            time.sleep(.3) # Don't spam the server too fast...
-            print "   done adding to playlist"
-            added_files += 1
-
-        if remove_missing:
-            for s in goog_songs:
-                print ""
-                print "Removing: %s" % s['title']
-                self.wc.remove_songs_from_playlist(plid, s.id)
+                        print "  upload failed - skipping"
+    
+                if not song_id:
+                    failed_files += 1
+                    continue
+    
+                added = self.wc.add_songs_to_playlist(plid, song_id)
                 time.sleep(.3) # Don't spam the server too fast...
-                removed_files += 1
-
-        print ""
-        print "---"
-        print "%d songs unmodified" % existing_files
-        print "%d songs added" % added_files
-        print "%d songs failed" % failed_files
-        print "%d songs removed" % removed_files
-
+                print "  done adding to playlist"
+                added_files += 1
+    
+            if remove_missing:
+                for s in goog_songs:
+                    print "  removing: %s" % s['title']
+                    self.wc.remove_songs_from_playlist(plid, s.id)
+                    time.sleep(.3) # Don't spam the server too fast...
+                    removed_files += 1
+                
+            print "%d songs unmodified" % existing_files
+            print "%d songs added" % added_files
+            print "%d songs failed" % failed_files
+            print "%d songs removed" % removed_files
+            print "Ended: %s" % filename
+        else:
+            print "  playlist %s didn't exist - skipping" % filename
 
     def get_files_from_playlist(self, filename):
         files = []
@@ -200,7 +189,7 @@ class MusicSync(object):
                 continue
             path  = os.path.abspath(self.get_platform_path(line))
             if not os.path.exists(path):
-                print "File not found: %s" % line
+                print "  file not found: %s" % line
                 continue
             files.append(path)
         f.close()
@@ -210,6 +199,8 @@ class MusicSync(object):
         tag = self.get_id3_tag(filename)
         i = 0
         while i < len(goog_songs):
+            # print "checking: %s" % tag
+            # print "against: %s" % goog_songs[i]
             if self.tag_compare(goog_songs[i], tag):
                 goog_songs.pop(i)
                 return True
@@ -221,9 +212,9 @@ class MusicSync(object):
         r = {}
         if 'title' not in data:
             title = os.path.splitext(os.path.basename(filename))[0]
-            print 'Found song with no ID3 title, setting using filename:'
-            print '  %s' % title
-            print '  (please note - the id3 format used (v2.4) is invisible to windows)'
+            print '  found song with no ID3 title, setting using filename:'
+            print '    %s' % title
+            print '    (please note - the id3 format used (v2.4) is invisible to windows)'
             data['title'] = [title]
             data.save()
         r['title'] = data['title'][0]
@@ -241,14 +232,14 @@ class MusicSync(object):
 
     def find_song(self, filename):
         tag = self.get_id3_tag(filename)
-        results = self.wc.search(tag['title'])
-        # NOTE - dianostic print here to check results if you're creating duplicates
-        #print results['song_hits']
-        #print "%s ][ %s ][ %s ][ %s" % (tag['title'], tag['artist'], tag['album'], tag['track'])
-        for r in results['song_hits']:
-            if self.tag_compare(r, tag):
-                # TODO: add rough time check to make sure its "close"
-                return r
+        
+        # NOTE - diagnostic print here to check results if you're creating duplicates
+        print "  [%s][%s][%s][%s]" % (tag['title'], tag['artist'], tag['album'], tag['track'])
+        for s in self.songs:
+            if self.tag_compare(s, tag):
+                print "  %s matches %s" % (s['title'], tag['title']) 
+                return s
+        print "  No matches for %s" % tag['title']
         return None
 
     def tag_compare(self, g_song, tag):
@@ -262,7 +253,7 @@ class MusicSync(object):
 
     def delete_song(self, sid):
         self.wc.delete_songs(sid)
-        print "Deleted song by id [%s]" % sid
+        print "  deleted song by id [%s]" % sid
 
     def get_platform_path(self, full_path):
         # Try to avoid messing with the path if possible
